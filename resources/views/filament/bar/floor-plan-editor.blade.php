@@ -28,25 +28,32 @@
         .fp-canvas .fp-item.is-selected { outline: 2px solid #2563eb; outline-offset: 1px; z-index: 50; }
         .fp-handle { position: absolute; right: -6px; bottom: -6px; width: 12px; height: 12px; border-radius: 3px; background: #2563eb; border: 2px solid #fff; cursor: nwse-resize; touch-action: none; }
         .fp-dirty { color: #b45309; font-weight: 600; font-size: .85rem; }
+        .fp-marquee { position: absolute; border: 1.5px dashed #2563eb; background: rgb(37 99 235 / .08); pointer-events: none; z-index: 60; }
+        .fp-align { display: grid; grid-template-columns: repeat(3, 1fr); gap: .3rem; }
+        .fp-align .fp-btn { justify-content: center; padding: .35rem .3rem; font-size: .75rem; }
     </style>
 
     <script>
+        // Selection is a list of {kind: 'e'|'t', o: <element or table>}. Shift/Ctrl-click toggles, dragging on the
+        // empty floor draws a box; dragging any selected item moves the whole group.
         window.floorPlanEditor = (initial, types) => ({
             plan: initial,
             types,
-            selected: null,
+            sel: [],
             snap: 0.5,
             dirty: false,
             saving: false,
             tmp: 0,
             action: null,
+            box: null,
 
             init() {
                 this.plan.elements.forEach(e => e.tmp = ++this.tmp);
             },
-            list(kind) { return kind === 'e' ? this.plan.elements : this.plan.tables; },
-            current() { return this.selected ? this.list(this.selected.kind)[this.selected.index] : {}; },
-            isSel(kind, i) { return this.selected && this.selected.kind === kind && this.selected.index === i; },
+            current() { return this.sel.length === 1 ? this.sel[0].o : {}; },
+            single(kind) { return this.sel.length === 1 && this.sel[0].kind === kind; },
+            isSel(o) { return this.sel.some(s => s.o === o); },
+            selOf(kind) { return this.sel.filter(s => s.kind === kind).map(s => s.o); },
             pct(v, total) { return (v / total * 100) + '%'; },
             boxStyle(o) {
                 return `left:${this.pct(o.x, this.plan.width)};top:${this.pct(o.y, this.plan.height)};width:${this.pct(o.w, this.plan.width)};height:${this.pct(o.h, this.plan.height)};`;
@@ -63,72 +70,182 @@
             },
             round(v) { return Math.round(v / this.snap) * this.snap; },
             unit() { return this.$refs.canvas.getBoundingClientRect().width / this.plan.width; },
+            point(e) {
+                const r = this.$refs.canvas.getBoundingClientRect(), u = r.width / this.plan.width;
+                return { x: (e.clientX - r.left) / u, y: (e.clientY - r.top) / u };
+            },
             clampBox(o) {
                 o.w = Math.max(0.5, Math.min(this.plan.width, o.w));
                 o.h = Math.max(0.5, Math.min(this.plan.height, o.h));
                 o.x = Math.max(0, Math.min(this.plan.width - o.w, o.x));
                 o.y = Math.max(0, Math.min(this.plan.height - o.h, o.y));
             },
-            startDrag(e, kind, index) {
-                this.selected = { kind, index };
-                const o = this.list(kind)[index];
-                this.action = { type: 'move', o, sx: e.clientX, sy: e.clientY, ox: o.x, oy: o.y, unit: this.unit() };
+            // Bounding box of a group of items.
+            bounds(items) {
+                return {
+                    x0: Math.min(...items.map(o => o.x)), y0: Math.min(...items.map(o => o.y)),
+                    x1: Math.max(...items.map(o => o.x + o.w)), y1: Math.max(...items.map(o => o.y + o.h)),
+                };
+            },
+            // Moves the selection by dx/dy from the given start positions, keeping the group inside the hall.
+            moveGroup(starts, dx, dy) {
+                const b = this.bounds(starts);
+                dx = Math.max(-b.x0, Math.min(this.plan.width - b.x1, dx));
+                dy = Math.max(-b.y0, Math.min(this.plan.height - b.y1, dy));
+                starts.forEach(s => { s.o.x = s.x + dx; s.o.y = s.y + dy; });
+            },
+            startDrag(e, kind, o) {
+                const toggle = e.shiftKey || e.ctrlKey || e.metaKey;
+                const was = this.isSel(o);
+                if (toggle) {
+                    if (was) { this.sel = this.sel.filter(s => s.o !== o); return; }
+                    this.sel.push({ kind, o });
+                } else if (!was) {
+                    this.sel = [{ kind, o }];
+                }
+                const starts = this.sel.map(s => ({ o: s.o, x: s.o.x, y: s.o.y, w: s.o.w, h: s.o.h }));
+                this.action = { type: 'move', o, starts, sx: e.clientX, sy: e.clientY, unit: this.unit(), moved: false, collapse: was && !toggle };
                 this.listen();
             },
-            startResize(e, kind, index) {
-                const o = this.list(kind)[index];
+            startResize(e, o) {
                 this.action = { type: 'resize', o, sx: e.clientX, sy: e.clientY, ow: o.w, oh: o.h, unit: this.unit() };
                 this.listen();
+            },
+            startBox(e) {
+                const p = this.point(e);
+                if (!(e.shiftKey || e.ctrlKey || e.metaKey)) this.sel = [];
+                this.action = { type: 'box', sx: e.clientX, sy: e.clientY, keep: [...this.sel] };
+                this.box = { x0: p.x, y0: p.y, x: p.x, y: p.y, w: 0, h: 0 };
+                this.listen();
+            },
+            boxSelect() {
+                const b = this.box, inside = o => o.x >= b.x && o.y >= b.y && o.x + o.w <= b.x + b.w && o.y + o.h <= b.y + b.h;
+                const hits = [
+                    ...this.plan.elements.filter(inside).map(o => ({ kind: 'e', o })),
+                    ...this.plan.tables.filter(t => t.x !== null && inside(t)).map(o => ({ kind: 't', o })),
+                ];
+                this.sel = [...this.action.keep, ...hits.filter(h => !this.action.keep.some(k => k.o === h.o))];
             },
             listen() {
                 const move = (e) => {
                     const a = this.action; if (!a) return;
+                    if (a.type === 'box') {
+                        const p = this.point(e), b = this.box;
+                        Object.assign(b, { x: Math.min(b.x0, p.x), y: Math.min(b.y0, p.y), w: Math.abs(p.x - b.x0), h: Math.abs(p.y - b.y0) });
+                        this.boxSelect();
+                        return;
+                    }
                     const dx = (e.clientX - a.sx) / a.unit, dy = (e.clientY - a.sy) / a.unit;
-                    if (a.type === 'move') { a.o.x = this.round(a.ox + dx); a.o.y = this.round(a.oy + dy); }
-                    else { a.o.w = Math.max(0.5, this.round(a.ow + dx)); a.o.h = Math.max(0.5, this.round(a.oh + dy)); }
-                    this.clampBox(a.o);
-                    if (Math.abs(dx) + Math.abs(dy) > 0.2) this.dirty = true;
+                    if (Math.abs(dx) + Math.abs(dy) > 0.2) { a.moved = true; this.dirty = true; }
+                    if (!a.moved) return;
+                    if (a.type === 'resize') {
+                        a.o.w = Math.max(0.5, this.round(a.ow + dx)); a.o.h = Math.max(0.5, this.round(a.oh + dy));
+                        this.clampBox(a.o);
+                    } else if (a.starts.length === 1) {
+                        // One item snaps to the grid itself.
+                        const s = a.starts[0];
+                        s.o.x = this.round(s.x + dx); s.o.y = this.round(s.y + dy); this.clampBox(s.o);
+                    } else {
+                        // A group moves in grid steps and keeps its relative positions.
+                        this.moveGroup(a.starts, this.round(dx), this.round(dy));
+                    }
                 };
-                const up = () => { this.action = null; window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+                const up = () => {
+                    const a = this.action;
+                    // A plain click on an item of a group selects only that item.
+                    if (a?.type === 'move' && !a.moved && a.collapse) this.sel = this.sel.filter(s => s.o === a.o);
+                    this.action = null; this.box = null;
+                    window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up);
+                };
                 window.addEventListener('pointermove', move);
                 window.addEventListener('pointerup', up);
             },
             key(e) {
-                if (!this.selected || ['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
-                const o = this.current();
+                if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+                if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); this.selectAll(); return; }
+                if (!this.sel.length) return;
                 const step = e.shiftKey ? 1 : this.snap;
                 const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
-                if (moves[e.key]) { e.preventDefault(); o.x += moves[e.key][0]; o.y += moves[e.key][1]; this.clampBox(o); this.dirty = true; }
-                if ((e.key === 'Delete' || e.key === 'Backspace') && this.selected.kind === 'e') { e.preventDefault(); this.remove(); }
-                if (e.key === 'Escape') this.selected = null;
+                if (moves[e.key]) {
+                    e.preventDefault();
+                    this.moveGroup(this.sel.map(s => ({ o: s.o, x: s.o.x, y: s.o.y, w: s.o.w, h: s.o.h })), ...moves[e.key]);
+                    this.dirty = true;
+                }
+                if ((e.key === 'Delete' || e.key === 'Backspace') && this.selOf('e').length) { e.preventDefault(); this.remove(); }
+                if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd' && this.selOf('e').length) { e.preventDefault(); this.duplicate(); }
+                if (e.key === 'Escape') this.sel = [];
             },
+            selectAll() {
+                this.sel = [
+                    ...this.plan.elements.map(o => ({ kind: 'e', o })),
+                    ...this.plan.tables.filter(t => t.x !== null).map(o => ({ kind: 't', o })),
+                ];
+            },
+            selectTables() { this.sel = this.plan.tables.filter(t => t.x !== null).map(o => ({ kind: 't', o })); },
             add(type) {
                 const t = this.types[type];
                 const el = { id: null, tmp: ++this.tmp, type, label: t.label, w: t.w, h: t.h, color: null,
                     x: this.round((this.plan.width - t.w) / 2), y: this.round((this.plan.height - t.h) / 2) };
                 this.clampBox(el);
                 this.plan.elements.push(el);
-                this.selected = { kind: 'e', index: this.plan.elements.length - 1 };
+                this.sel = [{ kind: 'e', o: this.plan.elements[this.plan.elements.length - 1] }];
                 this.dirty = true;
             },
             duplicate() {
-                const o = this.current();
-                const copy = { ...o, id: null, tmp: ++this.tmp, x: o.x + 1, y: o.y + 1 };
-                this.clampBox(copy);
-                this.plan.elements.push(copy);
-                this.selected = { kind: 'e', index: this.plan.elements.length - 1 };
+                const copies = this.selOf('e').map(o => {
+                    const copy = { ...JSON.parse(JSON.stringify(o)), id: null, tmp: ++this.tmp, x: o.x + 1, y: o.y + 1 };
+                    this.clampBox(copy);
+                    this.plan.elements.push(copy);
+                    return { kind: 'e', o: this.plan.elements[this.plan.elements.length - 1] };
+                });
+                this.sel = copies;
                 this.dirty = true;
             },
             rotate() {
-                const o = this.current();
-                [o.w, o.h] = [o.h, o.w];
-                this.clampBox(o);
+                this.sel.forEach(({ o }) => { [o.w, o.h] = [o.h, o.w]; this.clampBox(o); });
                 this.dirty = true;
             },
             remove() {
-                if (this.selected?.kind !== 'e') return;
-                this.plan.elements.splice(this.selected.index, 1);
-                this.selected = null;
+                const gone = this.selOf('e');
+                this.plan.elements = this.plan.elements.filter(o => !gone.includes(o));
+                this.sel = this.sel.filter(s => s.kind !== 'e');
+                this.dirty = true;
+            },
+            unplace() {
+                this.selOf('t').forEach(t => { t.x = null; t.y = null; });
+                this.sel = this.sel.filter(s => s.kind !== 't');
+                this.dirty = true;
+            },
+            // Align the selection to one side of the group, or centre it.
+            align(side) {
+                const items = this.sel.map(s => s.o), b = this.bounds(items);
+                items.forEach(o => {
+                    if (side === 'left') o.x = b.x0;
+                    if (side === 'right') o.x = b.x1 - o.w;
+                    if (side === 'top') o.y = b.y0;
+                    if (side === 'bottom') o.y = b.y1 - o.h;
+                    if (side === 'hcenter') o.x = this.round((b.x0 + b.x1 - o.w) / 2);
+                    if (side === 'vcenter') o.y = this.round((b.y0 + b.y1 - o.h) / 2);
+                    this.clampBox(o);
+                });
+                this.dirty = true;
+            },
+            // Equal gaps between the items, from the first to the last (needs 3 or more).
+            distribute(axis) {
+                const [pos, size] = axis === 'x' ? ['x', 'w'] : ['y', 'h'];
+                const items = this.sel.map(s => s.o).sort((a, b) => a[pos] - b[pos]);
+                if (items.length < 3) return;
+                const first = items[0], last = items[items.length - 1];
+                const total = items.reduce((sum, o) => sum + o[size], 0);
+                const gap = (last[pos] + last[size] - first[pos] - total) / (items.length - 1);
+                let at = first[pos];
+                items.forEach(o => { o[pos] = Math.round(at * 2) / 2; at += o[size] + gap; this.clampBox(o); });
+                this.dirty = true;
+            },
+            // Same size as the first selected item.
+            sameSize() {
+                const [first, ...rest] = this.sel.map(s => s.o);
+                rest.forEach(o => { o.w = first.w; o.h = first.h; this.clampBox(o); });
                 this.dirty = true;
             },
             freeSpot(w, h) {
@@ -140,20 +257,23 @@
                 }
                 return { x: 0, y: 0 };
             },
-            placeTable(i) {
+            placeTable(i, add = false) {
                 const t = this.plan.tables[i];
                 t.w = t.w || 2; t.h = t.h || 2;
                 Object.assign(t, this.freeSpot(t.w, t.h));
-                this.selected = { kind: 't', index: i };
+                this.sel = add ? [...this.sel, { kind: 't', o: t }] : [{ kind: 't', o: t }];
                 this.dirty = true;
             },
-            placeAll() { this.plan.tables.forEach((t, i) => { if (t.x === null) this.placeTable(i); }); },
+            placeAll() {
+                this.sel = [];
+                this.plan.tables.forEach((t, i) => { if (t.x === null) this.placeTable(i, true); });
+            },
             async suggest() {
                 if (this.dirty && !confirm('Het voorstel vervangt het huidige plan (pas definitief na Opslaan). Doorgaan?')) return;
                 const plan = await this.$wire.suggestion();
                 plan.elements.forEach(e => e.tmp = ++this.tmp);
                 this.plan = plan;
-                this.selected = null;
+                this.sel = [];
                 this.dirty = true;
             },
             async save() {
@@ -162,7 +282,7 @@
                     const saved = await this.$wire.savePlan(JSON.parse(JSON.stringify(this.plan)));
                     saved.elements.forEach(e => e.tmp = ++this.tmp);
                     this.plan = saved;
-                    this.selected = null;
+                    this.sel = [];
                     this.dirty = false;
                 } finally {
                     this.saving = false;
@@ -183,6 +303,8 @@
                     <option value="0.5">½</option><option value="1">1</option>
                 </select>
             </label>
+            <button type="button" class="fp-btn" x-on:click="selectAll()">Alles selecteren</button>
+            <button type="button" class="fp-btn" x-on:click="selectTables()">Alle tafels selecteren</button>
             <span class="fp-dirty" x-show="dirty">Niet opgeslagen</span>
         </div>
 
@@ -190,30 +312,31 @@
             <div>
                 <div class="fp-wrap">
                     <div class="fp-canvas" x-ref="canvas" :style="`aspect-ratio: ${plan.width} / ${plan.height}; --cols: ${plan.width}; --rows: ${plan.height};`"
-                         x-on:pointerdown.self="selected = null">
+                         x-on:pointerdown.self="startBox($event)">
                         <template x-for="(el, i) in plan.elements" :key="'e' + (el.id ?? el.tmp)">
-                            <div class="fp-item fp-el" :class="['fp-type-' + el.type, isSel('e', i) ? 'is-selected' : '']"
+                            <div class="fp-item fp-el" :class="['fp-type-' + el.type, isSel(el) ? 'is-selected' : '']"
                                  :style="boxStyle(el) + elStyle(el)"
-                                 x-on:pointerdown.stop="startDrag($event, 'e', i)">
+                                 x-on:pointerdown.stop="startDrag($event, 'e', el)">
                                 <span class="fp-label" x-text="el.label ?? ''"></span>
-                                <span class="fp-handle" x-show="isSel('e', i)" x-on:pointerdown.stop="startResize($event, 'e', i)"></span>
+                                <span class="fp-handle" x-show="isSel(el) && sel.length === 1" x-on:pointerdown.stop="startResize($event, el)"></span>
                             </div>
                         </template>
                         <template x-for="(t, i) in plan.tables" :key="'t' + t.id">
-                            <div class="fp-item fp-table" x-show="t.x !== null" :class="[t.shape === 'round' ? 'is-round' : '', t.active ? '' : 'is-inactive', isSel('t', i) ? 'is-selected' : '']"
-                                 :style="boxStyle(t)" x-on:pointerdown.stop="startDrag($event, 't', i)">
+                            <div class="fp-item fp-table" x-show="t.x !== null" :class="[t.shape === 'round' ? 'is-round' : '', t.active ? '' : 'is-inactive', isSel(t) ? 'is-selected' : '']"
+                                 :style="boxStyle(t)" x-on:pointerdown.stop="startDrag($event, 't', t)">
                                 <span class="fp-table-label" x-text="t.label"></span>
-                                <span class="fp-handle" x-show="isSel('t', i)" x-on:pointerdown.stop="startResize($event, 't', i)"></span>
+                                <span class="fp-handle" x-show="isSel(t) && sel.length === 1" x-on:pointerdown.stop="startResize($event, t)"></span>
                             </div>
                         </template>
+                        <div class="fp-marquee" x-show="box" x-cloak :style="box ? boxStyle(box) : ''"></div>
                     </div>
                 </div>
-                <p class="fp-hint" style="margin-top:.5rem">Sleep om te verplaatsen, het blauwe hoekje om te vergroten. Pijltjestoetsen verplaatsen het geselecteerde, Delete verwijdert het. Rij A hoort vooraan bij het podium, nummer 1 links.</p>
+                <p class="fp-hint" style="margin-top:.5rem">Sleep om te verplaatsen, het blauwe hoekje om te vergroten. Meerdere tegelijk: Shift/Ctrl + klik, of sleep een kader op een lege plek van de vloer (Ctrl+A = alles). Een selectie sleep je in één keer mee. Pijltjestoetsen verplaatsen de selectie (Shift = 1 vakje), Delete verwijdert, Ctrl+D dupliceert. Rij A hoort vooraan bij het podium, nummer 1 links.</p>
             </div>
 
             <div class="fp-side">
-                <div class="fp-card" x-show="selected">
-                    <template x-if="selected && selected.kind === 'e'">
+                <div class="fp-card" x-show="sel.length">
+                    <template x-if="single('e')">
                         <div>
                             <h3 x-text="(types[current().type]?.icon ?? '') + ' ' + (types[current().type]?.label ?? 'Element')"></h3>
                             <label class="fp-field">Tekst<input type="text" x-model="current().label" x-on:input="dirty = true" maxlength="100"></label>
@@ -235,7 +358,7 @@
                             </div>
                         </div>
                     </template>
-                    <template x-if="selected && selected.kind === 't'">
+                    <template x-if="single('t')">
                         <div>
                             <h3 x-text="'Tafel ' + current().label"></h3>
                             <div class="fp-two">
@@ -247,9 +370,34 @@
                             </label>
                             <div style="display:flex; gap:.4rem; flex-wrap:wrap">
                                 <button type="button" class="fp-btn" x-on:click="rotate()">Draaien 90°</button>
-                                <button type="button" class="fp-btn" x-on:click="current().x = null; current().y = null; selected = null; dirty = true">Van het plan halen</button>
+                                <button type="button" class="fp-btn" x-on:click="unplace()">Van het plan halen</button>
                             </div>
                             <p class="fp-hint" style="margin-top:.5rem">Rij en nummer wijzig je bij Bar → Tafels.</p>
+                        </div>
+                    </template>
+                    <template x-if="sel.length > 1">
+                        <div>
+                            <h3 x-text="sel.length + ' geselecteerd' + ' (' + selOf('t').length + ' tafels, ' + selOf('e').length + ' elementen)'"></h3>
+                            <p class="fp-hint" style="margin:0 0 .4rem">Uitlijnen</p>
+                            <div class="fp-align">
+                                <button type="button" class="fp-btn" x-on:click="align('left')" title="Links uitlijnen">⇤ Links</button>
+                                <button type="button" class="fp-btn" x-on:click="align('hcenter')" title="Horizontaal centreren">↔ Midden</button>
+                                <button type="button" class="fp-btn" x-on:click="align('right')" title="Rechts uitlijnen">Rechts ⇥</button>
+                                <button type="button" class="fp-btn" x-on:click="align('top')" title="Boven uitlijnen">⤒ Boven</button>
+                                <button type="button" class="fp-btn" x-on:click="align('vcenter')" title="Verticaal centreren">↕ Midden</button>
+                                <button type="button" class="fp-btn" x-on:click="align('bottom')" title="Onder uitlijnen">⤓ Onder</button>
+                            </div>
+                            <div style="display:flex; gap:.4rem; flex-wrap:wrap; margin-top:.5rem">
+                                <button type="button" class="fp-btn" x-on:click="distribute('x')" :disabled="sel.length < 3">Gelijk verdelen ↔</button>
+                                <button type="button" class="fp-btn" x-on:click="distribute('y')" :disabled="sel.length < 3">Gelijk verdelen ↕</button>
+                                <button type="button" class="fp-btn" x-on:click="sameSize()">Zelfde grootte</button>
+                                <button type="button" class="fp-btn" x-on:click="rotate()">Elk 90° draaien</button>
+                                <button type="button" class="fp-btn" x-show="selOf('e').length" x-on:click="duplicate()">Elementen dupliceren</button>
+                                <button type="button" class="fp-btn" x-show="selOf('t').length" x-on:click="unplace()">Tafels van het plan halen</button>
+                                <button type="button" class="fp-btn" style="color:#b91c1c" x-show="selOf('e').length" x-on:click="remove()">Elementen verwijderen</button>
+                                <button type="button" class="fp-btn" x-on:click="sel = []">Selectie opheffen</button>
+                            </div>
+                            <p class="fp-hint" style="margin-top:.5rem">"Zelfde grootte" neemt de maat van het eerst geselecteerde. Tafels worden nooit verwijderd, alleen van het plan gehaald.</p>
                         </div>
                     </template>
                 </div>
