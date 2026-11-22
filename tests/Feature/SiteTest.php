@@ -109,6 +109,8 @@ class SiteTest extends TestCase
     public function test_robots_and_sitemap(): void
     {
         $this->get('/robots.txt')->assertOk()->assertSee('Disallow: /');
-        $this->get('/sitemap.xml')->assertOk()->assertSee(url('/privacy'));
+        $production = \App\Models\Production::query()->published()->firstOrFail();
+        $this->get('/sitemap.xml')->assertOk()->assertSee(url('/privacy'))
+            ->assertSee(route('productions.index'))->assertSee($production->url());
     }
 }
